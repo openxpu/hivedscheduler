@@ -231,6 +231,16 @@ func ToIndicesString(indices []int32) string {
 	return indicesStr
 }
 
+func ToIndicesStringXPU(indices []int32, percent int32) string {
+	strIndices := []string{}
+
+	for _, i := range indices {
+		strIndices = append(strIndices, fmt.Sprintf("%v:%v%%", i, percent))
+	}
+	indicesStr := strings.Join(strIndices, ",")
+	return indicesStr
+}
+
 func StringsContains(s []string, e string) bool {
 	for _, te := range s {
 		if te == e {

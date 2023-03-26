@@ -28,6 +28,8 @@ import (
 
 	"github.com/microsoft/hivedscheduler/pkg/api"
 	"github.com/microsoft/hivedscheduler/pkg/common"
+
+	"k8s.io/klog"
 )
 
 // topologyAwareScheduler can schedule a set of pods on a cluster view.
@@ -65,6 +67,7 @@ func NewTopologyAwareScheduler(
 func (t *topologyAwareScheduler) Schedule(
 	podLeafCellNumbers map[int32]int32,
 	p CellPriority,
+	s CellPercent,
 	suggestedNodes common.Set,
 	ignoreSuggestedNodes bool) (
 	podPlacements map[int32][]CellList,
@@ -81,13 +84,14 @@ func (t *topologyAwareScheduler) Schedule(
 
 	// disable preemption first (reduce preemption)
 	priority := opportunisticPriority
-	t.updateClusterView(priority, suggestedNodes, ignoreSuggestedNodes)
+	percent  := s
+	t.updateClusterView(priority, percent, suggestedNodes, ignoreSuggestedNodes)
 	// try to fit the pods to a set of nodes
 	selectedNodeIndices, failedReason := findNodesForPods(t.cv, sortedPodLeafCellNumbers)
 	// enable preemption if scheduling failed
 	if selectedNodeIndices == nil && p > opportunisticPriority {
 		priority = p
-		t.updateClusterView(priority, suggestedNodes, ignoreSuggestedNodes)
+		t.updateClusterView(priority, percent, suggestedNodes, ignoreSuggestedNodes)
 		selectedNodeIndices, failedReason = findNodesForPods(t.cv, sortedPodLeafCellNumbers)
 	}
 	if selectedNodeIndices == nil {
@@ -106,7 +110,8 @@ func (t *topologyAwareScheduler) Schedule(
 		n := selectedNodes[podIndex]
 		// TODO: Optimize findNodesForPods and findLeafCellsInNode together to get a better placement,
 		//  such as also aware intra node topology when findNodesForPods.
-		selectedLeafCells, nodeAvailableLeafCells[n] = findLeafCellsInNode(n, leafCellNumber, priority, nodeAvailableLeafCells[n], t.levelLeafCellNum)
+		selectedLeafCells, nodeAvailableLeafCells[n] = findLeafCellsInNode(n, leafCellNumber, priority, percent, nodeAvailableLeafCells[n], t.levelLeafCellNum)
+		klog.V(4).Infof("OPENXPU selectedLeafCells (%v) leafCellNumer (%v)", selectedLeafCells, leafCellNumber)
 		if podPlacements[leafCellNumber] == nil {
 			podPlacements[leafCellNumber] = []CellList{}
 		}
@@ -120,6 +125,8 @@ type node struct {
 	freeLeafCellNumAtPriority     int32           // free leaf cell number at the priority of the pod to be scheduled (lower priority considered as free)
 	usedLeafCellNumSamePriority   int32           // leaf cell number used by the same priority as that of the pod to be scheduled
 	usedLeafCellNumHigherPriority int32           // leaf cell number used by higher priorities than that of the pod to be scheduled
+	freeLeafCellNumHigherPercent  int32           // leaf cell number with higher percent left
+	usedLeafCellNumAtPercent      int32           // leaf cell number with lower or same percent
 	healthy                       bool            // if the node is healthy
 	suggested                     bool            // if the node is within suggested nodes
 	nodeAddress                   api.CellAddress // used for logging the node address when bad or not suggested
@@ -149,6 +156,17 @@ func (n *node) updateUsedLeafCellNumForPriority(p CellPriority, crossPriorityPac
 		}
 		if priority >= p {
 			n.freeLeafCellNumAtPriority -= num
+		}
+	}
+}
+
+func (n *node) updateUsedLeafCellNumForPercent(p CellPercent) {
+	//n.usedLeafCellNumAtPercent = n.c.GetUsedLeafCellNumAtPercents()[p]
+	n.freeLeafCellNumHigherPercent = n.c.GetTotalLeafCellNum()
+	for percent, num := range n.c.GetUsedLeafCellNumAtPercents() {
+		if (maxGuaranteedPercent - percent) < p {
+			//n.usedLeafCellNumAtPercent += num
+			n.freeLeafCellNumHigherPercent -= num
 		}
 	}
 }
@@ -230,11 +248,13 @@ func (cv clusterView) Swap(i int, j int) {
 // updateClusterView updates the leaf cell numbers of the nodes for the sorting.
 func (t *topologyAwareScheduler) updateClusterView(
 	p CellPriority,
+	s CellPercent,
 	suggestedNodes common.Set,
 	ignoreSuggestedNodes bool) {
 
 	for _, n := range t.cv {
 		n.updateUsedLeafCellNumForPriority(p, t.crossPriorityPack)
+		n.updateUsedLeafCellNumForPercent(s)
 		n.healthy, n.suggested, n.nodeAddress = nodeHealthyAndInSuggested(n, suggestedNodes, ignoreSuggestedNodes)
 	}
 }
@@ -281,7 +301,10 @@ func findNodesForPods(cv clusterView, leafCellNums []int32) (pickedNodeIndices [
 	var n *node
 	for nodeIndex := 0; nodeIndex < len(cv); {
 		n = cv[nodeIndex]
-		if n.freeLeafCellNumAtPriority-pickedLeafCellNum >= leafCellNums[podIndex] {
+		// both priority and percent must be satisfied
+		klog.V(4).Infof("OPENXPU node (%v)", n.c.GetAddress())
+		klog.V(4).Infof("OPENXPU freeLeafCellNumAtPriority (%v) freeLeafCellNumHigherPercent (%v) pickedLeafCellNum (%v)", n.freeLeafCellNumAtPriority, n.freeLeafCellNumHigherPercent, pickedLeafCellNum)
+		if (n.freeLeafCellNumAtPriority - pickedLeafCellNum >= leafCellNums[podIndex]) && (n.freeLeafCellNumHigherPercent - pickedLeafCellNum >= leafCellNums[podIndex]) {
 			// fail when encountering a node that is either bad or not within suggested nodes
 			if !n.healthy {
 				return nil, fmt.Sprintf(
@@ -310,6 +333,7 @@ func findLeafCellsInNode(
 	n Cell,
 	leafCellNum int32,
 	p CellPriority,
+	s CellPercent,
 	availableLeafCells CellList,
 	levelLeafCellNum map[CellLevel]int32) (CellList, CellList) {
 
@@ -330,7 +354,8 @@ func findLeafCellsInNode(
 	if availableLeafCells == nil {
 		availableLeafCells = CellList{}
 		preemptibleLeafCells := CellList{}
-		availableLeafCells, preemptibleLeafCells = getLeafCellsFromNode(n, p, availableLeafCells, preemptibleLeafCells)
+		availableLeafCells, preemptibleLeafCells = getLeafCellsFromNode(n, p, s, availableLeafCells, preemptibleLeafCells)
+		klog.V(4).Infof("OPENXPU availableLeafCells (%v) preemptibleLeafCells (%v)", availableLeafCells, preemptibleLeafCells)
 		// free leaf cells will be used first (before preemptible leaf cells)
 		availableLeafCells = append(availableLeafCells, preemptibleLeafCells...)
 	}
@@ -340,6 +365,7 @@ func findLeafCellsInNode(
 	for {
 		for availableLeafCellIndex < int32(len(availableLeafCells)) {
 			leafCell = availableLeafCells[availableLeafCellIndex]
+			klog.V(4).Infof("OPENXPU leafCell (%v)", leafCell.GetAddress())
 			currentLeafCellIndices[searchLeafCellIndex] = availableLeafCellIndex
 			if searchLeafCellIndex == 0 {
 				currentAffinity[searchLeafCellIndex] = leafCell
@@ -461,15 +487,16 @@ func findLCA(lower Cell, higher Cell) Cell {
 	return lower.GetParent()
 }
 
-// getLeafCellsFromNode collects free leaf cells and preemptible leaf cells according to the priority.
-func getLeafCellsFromNode(c Cell, p CellPriority, freeLeafCells CellList, preemptibleLeafCells CellList) (CellList, CellList) {
+// getLeafCellsFromNode collects free leaf cells and preemptible leaf cells according to the priority and left percent.
+func getLeafCellsFromNode(c Cell, p CellPriority, s CellPercent, freeLeafCells CellList, preemptibleLeafCells CellList) (CellList, CellList) {
+	klog.V(4).Infof("OPENXPU c.GetLevel (%v), c.GetAddress (%v) c.GetPercent (%v), need (%v)", c.GetAddress(), c.GetLevel(), c.GetPercent(), s)
 	if c.GetLevel() > 1 {
 		for _, cc := range c.GetChildren() {
-			freeLeafCells, preemptibleLeafCells = getLeafCellsFromNode(cc, p, freeLeafCells, preemptibleLeafCells)
+			freeLeafCells, preemptibleLeafCells = getLeafCellsFromNode(cc, p, s, freeLeafCells, preemptibleLeafCells)
 		}
-	} else if c.GetPriority() == freePriority {
+	} else if (c.GetPriority() == freePriority) || (maxGuaranteedPercent - c.GetPercent() >= s) {
 		freeLeafCells = append(freeLeafCells, c)
-	} else if c.GetPriority() < p {
+	} else if (c.GetPriority() < p) {
 		preemptibleLeafCells = append(preemptibleLeafCells, c)
 	}
 	return freeLeafCells, preemptibleLeafCells

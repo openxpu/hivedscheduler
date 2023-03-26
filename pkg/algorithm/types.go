@@ -30,12 +30,14 @@ import (
 	"github.com/microsoft/hivedscheduler/pkg/common"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog"
 )
 
 type (
 	CellChain          string // name of a cell chain (type of the top-level cell)
 	CellLevel          int32
 	CellPriority       int32
+	CellPercent        int32
 	CellState          string
 	AffinityGroupState string
 )
@@ -47,8 +49,10 @@ type schedulingRequest struct {
 	affinityGroupName    string
 	affinityGroupPodNums map[int32]int32 // leaf cell number -> pod number
 	priority             CellPriority
+	percent              CellPercent
 	suggestedNodes       common.Set
 	ignoreSuggestedNodes bool
+	quota                api.Quota
 }
 
 // CellList is a list of cells at a certain level of a chain.
@@ -88,7 +92,10 @@ func (cl CellList) remove(c Cell) CellList {
 			c.GetAddress()))
 	}
 	length := len(cl)
-	cl[index] = cl[length-1]
+	for i:= index; i < length-1; i++ {
+		cl[i] = cl[i+1]
+	}
+	//cl[index] = cl[length-1]
 	cl[length-1] = nil
 	return cl[:length-1]
 }
@@ -138,6 +145,7 @@ type AlgoAffinityGroup struct {
 	// Note that we always avoid using bad nodes; avoiding non-suggested nodes is optional and best-effort.
 	ignoreK8sSuggestedNodes   bool
 	priority                  int32
+	percent                   int32
 	totalPodNums              map[int32]int32       // LeafCellNum -> PodNum
 	allocatedPods             map[int32][]*core.Pod // LeafCellNum -> a list of allocated pods
 	preemptingPods            map[types.UID]*core.Pod
@@ -145,6 +153,7 @@ type AlgoAffinityGroup struct {
 	virtualLeafCellPlacement  groupVirtualPlacement
 	state                     AffinityGroupState
 	lazyPreemptionStatus      *api.LazyPreemptionStatus
+	quota                     api.Quota
 }
 
 func newAlgoAffinityGroup(
@@ -152,6 +161,8 @@ func newAlgoAffinityGroup(
 	vc api.VirtualClusterName,
 	lazyPreemptionEnable bool,
 	priority int32,
+	percent  int32,
+	quota api.Quota,
 	state AffinityGroupState) *AlgoAffinityGroup {
 
 	podNums := make(map[int32]int32)
@@ -163,11 +174,13 @@ func newAlgoAffinityGroup(
 		vc:                        vc,
 		lazyPreemptionEnable:      lazyPreemptionEnable,
 		priority:                  priority,
+		percent:                   percent,
 		totalPodNums:              podNums,
 		allocatedPods:             map[int32][]*core.Pod{},
 		physicalLeafCellPlacement: groupPhysicalPlacement{},
 		virtualLeafCellPlacement:  groupVirtualPlacement{},
 		state:                     state,
+		quota:                     quota,
 	}
 	if state == groupPreempting {
 		group.preemptingPods = map[types.UID]*core.Pod{}
@@ -190,6 +203,7 @@ func (aag *AlgoAffinityGroup) ToAffinityGroup() api.AffinityGroup {
 		Status: api.AffinityGroupStatus{
 			VC:                   aag.vc,
 			Priority:             aag.priority,
+			Percent:              aag.percent,
 			State:                api.AffinityGroupState(aag.state),
 			LazyPreemptionStatus: aag.lazyPreemptionStatus,
 		},
@@ -292,9 +306,12 @@ func (p groupVirtualPlacement) toBindingPaths(
 	for _, podLeafCellNum := range leafCellNums {
 		podPlacements := p[podLeafCellNum]
 		for _, podPlacement := range podPlacements {
+			klog.V(4).Infof("OPENXPU podPlacement [%v]", podPlacement)
 			for _, leafCell := range podPlacement {
+				klog.V(4).Infof("OPENXPU leafCell (%v)", leafCell.GetAddress())
 				if pLeafCell := leafCell.(*VirtualCell).GetPhysicalCell(); pLeafCell != nil {
 					bindings[leafCell.GetAddress()] = pLeafCell
+					klog.V(4).Infof("OPENXPU already bingdings [%v]=[%v]", leafCell.GetAddress(), pLeafCell.GetAddress())
 					continue
 				}
 				var bindingPath []*VirtualCell
@@ -305,7 +322,11 @@ func (p groupVirtualPlacement) toBindingPaths(
 					}
 					bindingPath = append(bindingPath, vc)
 				}
+				for k, v := range bindingPath {
+					klog.V(4).Infof("OPENXPU bindingPath [%v]=[%v]", k, v.GetAddress())
+				}
 				pathRoot := bindingPath[len(bindingPath)-1]
+				klog.V(4).Infof("OPENXPU pathRoot [%v]", pathRoot.GetAddress())
 				n := &cellBindingPathVertex{cell: pathRoot}
 				allBindingPathVertices[pathRoot.GetAddress()] = n
 				if parent := pathRoot.GetParent(); parent == nil {

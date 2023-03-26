@@ -48,7 +48,7 @@ func generatePodScheduleResult(
 	suggestedNodes common.Set,
 	pod *core.Pod) internal.PodScheduleResult {
 
-	klog.V(4).Infof("[%v]: Got K8s suggested nodes: %v", internal.Key(pod), suggestedNodes)
+	klog.Infof("[%v]: Got K8s suggested nodes: %v", internal.Key(pod), suggestedNodes)
 	if groupPhysicalPlacement == nil {
 		klog.Infof("[%v]: Pod needs to wait, reason: %v", internal.Key(pod), waitReason)
 		return internal.PodScheduleResult{PodWaitInfo: &internal.PodWaitInfo{Reason: waitReason}}
@@ -212,6 +212,7 @@ func collectPreemptionVictims(placement groupPhysicalPlacement) (
 				}
 				pLeafCell := leafCell.(*PhysicalCell)
 				state := pLeafCell.GetState()
+				// OPENXPU: Only Used can be preempt not Half Used
 				if state == cellUsed || state == cellReserving {
 					// for any victim pod, gang-preempt all the other pods from the same affinity group
 					for _, pods := range pLeafCell.GetUsingGroup().allocatedPods {
@@ -425,6 +426,7 @@ func generateOTVirtualCell(pc *api.PhysicalCellStatus) *api.VirtualCellStatus {
 			CellState:       api.CellState(cellUsed),
 			CellHealthiness: pc.CellHealthiness,
 			CellPriority:    api.OpportunisticPriority,
+			CellPercent:     api.MinGuaranteedPercent,
 		},
 		PhysicalCell: pc,
 	}

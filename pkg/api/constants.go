@@ -48,6 +48,7 @@ const (
 	// To leverage this scheduler, the Pod could reference below annotation to
 	// use the allocated leaf cells for the whole Pod.
 	AnnotationKeyPodLeafCellIsolation      = GroupName + "/pod-leaf-cell-isolation"
+	AnnotationKeyPodLeafCellXpus           = GroupName + "/pod-leaf-cell-xpus"
 	DeprecatedAnnotationKeyPodGpuIsolation = GroupName + "/pod-gpu-isolation"
 
 	// Populated by this scheduler, used to track and recover allocated placement.
@@ -60,6 +61,10 @@ const (
 
 	// Priority of Opportunistic Pod.
 	OpportunisticPriority = int32(-1)
+
+	// Percent Range of Guaranteed Pod.
+	MaxGuaranteedPercent = int32(100)
+	MinGuaranteedPercent = int32(0)
 )
 
 var EnvValueConfigFilePath = common.GetEnv("CONFIG", "./hivedscheduler.yaml")

@@ -106,6 +106,7 @@ func (s *defaultIntraVCScheduler) schedule(
 		placement, failedReason = scheduler.Schedule(
 			sr.affinityGroupPodNums,
 			sr.priority,
+			sr.percent,
 			sr.suggestedNodes,
 			sr.ignoreSuggestedNodes)
 	}

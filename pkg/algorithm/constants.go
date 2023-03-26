@@ -34,6 +34,10 @@ const (
 	opportunisticPriority = CellPriority(api.OpportunisticPriority)
 	freePriority          = opportunisticPriority - 1
 
+	// internel cell percent
+	maxGuaranteedPercent = CellPercent(api.MaxGuaranteedPercent)
+	minGuaranteedPercent = CellPercent(api.MinGuaranteedPercent)
+
 	// lowest and highest levels in a cell chain
 	lowestLevel  CellLevel = 1
 	highestLevel CellLevel = math.MaxInt32
@@ -45,6 +49,8 @@ const (
 	// Note that a Free cell may also have binding (e.g., when it is a doomed bad cell),
 	// and we should not use such Free cell for cell binding.
 	cellFree CellState = "Free"
+	// An affinity group is using this cell by percent.
+	cellHalf CellState = "HalfUsed"
 	// An affinity group is using this cell, and no other group is reserving or has reserved it.
 	// A Used cell's priority is that of the group using the cell.
 	cellUsed CellState = "Used"

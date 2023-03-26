@@ -174,11 +174,15 @@ func NewBindingPod(pod *core.Pod, podBindInfo *si.PodBindInfo) *core.Pod {
 
 	bindingPod.Spec.NodeName = podBindInfo.Node
 
+	s := ExtractPodSchedulingSpec(bindingPod)
+
 	if bindingPod.Annotations == nil {
 		bindingPod.Annotations = map[string]string{}
 	}
 	bindingPod.Annotations[si.AnnotationKeyPodLeafCellIsolation] =
 		common.ToIndicesString(podBindInfo.LeafCellIsolation)
+	bindingPod.Annotations[si.AnnotationKeyPodLeafCellXpus] =
+		common.ToIndicesStringXPU(podBindInfo.LeafCellIsolation, s.Percent)
 	bindingPod.Annotations[si.AnnotationKeyPodBindInfo] =
 		common.ToYaml(podBindInfo)
 
@@ -215,6 +219,7 @@ func ExtractPodBindAnnotations(allocatedPod *core.Pod) map[string]string {
 	if _, ok := allocatedPod.Annotations[si.AnnotationKeyPodLeafCellIsolation]; ok {
 		return map[string]string{
 			si.AnnotationKeyPodLeafCellIsolation: allocatedPod.Annotations[si.AnnotationKeyPodLeafCellIsolation],
+			si.AnnotationKeyPodLeafCellXpus:      allocatedPod.Annotations[si.AnnotationKeyPodLeafCellXpus],
 			si.AnnotationKeyPodBindInfo:          allocatedPod.Annotations[si.AnnotationKeyPodBindInfo],
 		}
 	} else {
@@ -285,6 +290,8 @@ func ExtractPodSchedulingSpec(pod *core.Pod) *si.PodSchedulingSpec {
 		panic(fmt.Errorf(errPfx + "AffinityGroup.Members does not contains current Pod"))
 	}
 
+	klog.V(4).Infof("OPENXPU podSchedulingSpec.Percent (%v)", podSchedulingSpec.Percent)
+
 	return &podSchedulingSpec
 }
 
@@ -307,10 +314,11 @@ func BindPod(kClient kubeClient.Interface, bindingPod *core.Pod) {
 		panic(fmt.Errorf("Failed to bind Pod: %v", err))
 	}
 
-	klog.Infof("[%v]: Succeeded to bind Pod on node %v, leaf cells %v",
+	klog.Infof("[%v]: Succeeded to bind Pod on node %v, leaf cells %v, leaf xpus %v",
 		Key(bindingPod),
 		bindingPod.Spec.NodeName,
-		bindingPod.Annotations[si.AnnotationKeyPodLeafCellIsolation])
+		bindingPod.Annotations[si.AnnotationKeyPodLeafCellIsolation],
+		bindingPod.Annotations[si.AnnotationKeyPodLeafCellXpus])
 }
 
 func NewBadRequestError(message string) *si.WebServerError {

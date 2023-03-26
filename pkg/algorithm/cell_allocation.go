@@ -43,14 +43,17 @@ func buddyAlloc(
 	cell *cellBindingPathVertex,
 	freeList ChainCellList,
 	currentLevel CellLevel,
+	percent CellPercent,
 	suggestedNodes common.Set,
 	ignoreSuggestedNodes bool,
 	bindings map[api.CellAddress]*PhysicalCell) bool {
 
+	klog.V(4).Infof("OPENXPU buddyAlloc")
 	if currentLevel == cell.cell.GetLevel() {
 		ok, pickedCells := mapVirtualCellsToPhysical(
 			[]*cellBindingPathVertex{cell},
 			freeList[currentLevel],
+			percent,
 			suggestedNodes,
 			ignoreSuggestedNodes,
 			bindings,
@@ -63,13 +66,13 @@ func buddyAlloc(
 		}
 		return false
 	}
-	freeCells := getUsablePhysicalCells(freeList[currentLevel], 1, suggestedNodes, ignoreSuggestedNodes)
+	freeCells := getUsablePhysicalCells(freeList[currentLevel], 1, percent, suggestedNodes, ignoreSuggestedNodes)
 	if freeCells == nil {
 		return false
 	}
 	for _, c := range freeCells {
 		freeList[currentLevel-1] = append(freeList[currentLevel-1], c.GetChildren()...)
-		if buddyAlloc(cell, freeList, currentLevel-1, suggestedNodes, ignoreSuggestedNodes, bindings) {
+		if buddyAlloc(cell, freeList, currentLevel-1, percent, suggestedNodes, ignoreSuggestedNodes, bindings) {
 			freeList.remove(c, currentLevel)
 			return true
 		} else {
@@ -83,6 +86,7 @@ func buddyAlloc(
 // try to split a higher level cell safely to get current level cells
 func safeRelaxedBuddyAlloc(
 	cell *cellBindingPathVertex,
+	percent CellPercent,
 	freeList ChainCellList,
 	freeCellNum map[CellLevel]int32,
 	currentLevel CellLevel,
@@ -134,6 +138,7 @@ func safeRelaxedBuddyAlloc(
 			ok, pickedCells := mapVirtualCellsToPhysical(
 				[]*cellBindingPathVertex{cell},
 				freeList[currentLevel],
+				percent,
 				suggestedNodes,
 				ignoreSuggestedNodes,
 				bindings,
@@ -166,6 +171,7 @@ func getLowestFreeCellLevel(freeList ChainCellList, l CellLevel) CellLevel {
 func mapVirtualPlacementToPhysical(
 	preassignedCells []*cellBindingPathVertex,
 	nonPreassignedCells [][]*cellBindingPathVertex,
+	percent CellPercent,
 	freeList ChainCellList,
 	freeCellNum map[CellLevel]int32,
 	suggestedNodes common.Set,
@@ -174,9 +180,9 @@ func mapVirtualPlacementToPhysical(
 
 	for _, c := range preassignedCells {
 		if !buddyAlloc(c, freeList, getLowestFreeCellLevel(
-			freeList, c.cell.GetLevel()), suggestedNodes, ignoreSuggestedNodes, bindings) {
+			freeList, c.cell.GetLevel()), percent, suggestedNodes, ignoreSuggestedNodes, bindings) {
 			klog.Info("Buddy allocation failed due to bad cells, try to split higher level cells")
-			if !safeRelaxedBuddyAlloc(c, freeList, freeCellNum, c.cell.GetLevel(),
+			if !safeRelaxedBuddyAlloc(c, percent, freeList, freeCellNum, c.cell.GetLevel(),
 				suggestedNodes, ignoreSuggestedNodes, bindings) {
 				klog.Info("Cannot split higher level cells")
 				return false
@@ -188,7 +194,7 @@ func mapVirtualPlacementToPhysical(
 	for _, cells := range nonPreassignedCells {
 		ok, _ := mapVirtualCellsToPhysical(
 			cells, cells[0].cell.GetParent().(*VirtualCell).GetPhysicalCell().GetChildren(),
-			suggestedNodes, ignoreSuggestedNodes, bindings, false)
+			percent, suggestedNodes, ignoreSuggestedNodes, bindings, false)
 		if !ok {
 			return false
 		}
@@ -200,13 +206,18 @@ func mapVirtualPlacementToPhysical(
 func getUsablePhysicalCells(
 	candidates CellList,
 	numNeeded int32,
+	percent CellPercent,
 	suggestedNodes common.Set,
 	ignoreSuggestedNodes bool) (usableCandidates CellList) {
+
+	klog.V(4).Infof("OPENXPU candidates list (%v)", candidates)
 
 	for i := range candidates {
 		c := candidates[i].(*PhysicalCell)
 		// skip the cell if it is already bound
-		if c.GetVirtualCell() != nil {
+		// check the cell left percent is ok
+		klog.V(4).Infof("OPENXPU candidates cell (%v)", c.GetAddress())
+		if c.GetVirtualCell() != nil && (maxGuaranteedPercent - c.GetPercent() < percent) {
 			continue
 		}
 		// skip the cell if it is a bad node
@@ -239,6 +250,7 @@ func getUsablePhysicalCells(
 		return usableCandidates[i].GetUsedLeafCellNumAtPriorities()[opportunisticPriority] <
 			usableCandidates[j].GetUsedLeafCellNumAtPriorities()[opportunisticPriority]
 	})
+	klog.V(4).Infof("OPENXPU usableCandidates (%v)", usableCandidates)
 	return usableCandidates
 }
 
@@ -252,15 +264,23 @@ func getUsablePhysicalCells(
 func mapVirtualCellsToPhysical(
 	cells []*cellBindingPathVertex,
 	candidates CellList,
+	percent CellPercent,
 	suggestedNodes common.Set,
 	ignoreSuggestedNodes bool,
 	bindings map[api.CellAddress]*PhysicalCell,
 	returnPicked bool) (ok bool, pickedCells CellList) {
 
-	candidates = getUsablePhysicalCells(candidates, int32(len(cells)), suggestedNodes, ignoreSuggestedNodes)
+	candidates = getUsablePhysicalCells(candidates, int32(len(cells)), percent, suggestedNodes, ignoreSuggestedNodes)
 	if candidates == nil {
 		return false, nil
 	}
+
+	// OPENXPU: as we can bind physical cell twice for different task, so in the same task we must
+	// remove the candidates binding before
+	for _, v := range bindings {
+		candidates = candidates.remove(v)
+	}
+	klog.V(4).Infof("OPENXPU candidates after dedup (%v)", candidates)
 	cellIndex := int32(0)
 	candidateIndex := int32(0)
 	pickedCandidateIndices := make([]int32, len(cells))
@@ -281,6 +301,7 @@ func mapVirtualCellsToPhysical(
 				picked, _ = mapVirtualCellsToPhysical(
 					cells[cellIndex].childrenToBind,
 					candidate.GetChildren(),
+					percent,
 					suggestedNodes,
 					ignoreSuggestedNodes,
 					bindings,
@@ -449,6 +470,31 @@ func updateUsedLeafCellNumAtPriority(c Cell, p CellPriority, increase bool) {
 			delta = 1
 		}
 		c.IncreaseUsedLeafCellNumAtPriority(p, delta)
+		c = c.GetParent()
+	}
+}
+
+// setCellPercent sets percent for only leaf cell
+func setCellPercent(c Cell, p CellPercent, increase bool) {
+	percent := int32(0)
+	if increase {
+		percent = int32(c.GetPercent() + p)
+	} else {
+		percent = int32(c.GetPercent() - p)
+	}
+	if percent > int32(maxGuaranteedPercent) || percent < int32(minGuaranteedPercent)  {
+		// Unreachable
+		panic(fmt.Sprintf("Assert Failure: cell usage percent exceeds the capacity of the current cell"))
+	}
+	c.SetPercent(CellPercent(percent))
+}
+
+// updateUsedLeafCellNumAtPercent updates the number of used leaf cells at a percent for a cell
+// and its parent recursively.
+func updateUsedLeafCellNumAtPercent(c Cell, pOld CellPercent, pNew CellPercent) {
+	for c != nil {
+		c.IncreaseUsedLeafCellNumAtPercent(pOld, -1)
+		c.IncreaseUsedLeafCellNumAtPercent(pNew, 1)
 		c = c.GetParent()
 	}
 }
