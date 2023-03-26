@@ -48,6 +48,8 @@ type HivedAlgorithm struct {
 	freeCellList map[CellChain]ChainCellList
 	// all affinity groups that have been allocated or are preempting other groups
 	affinityGroups map[string]*AlgoAffinityGroup
+	// quota exclude VCs
+	quotaExcludeVCs []string
 
 	// vcFreeCellNum, allVCFreeCellNum, and totalLeftCellNum are used to track cell usage of the VCs.
 	// Note that these numbers count both healthy and bad cells.
@@ -124,6 +126,7 @@ func NewHivedAlgorithm(sConfig *api.Config) *HivedAlgorithm {
 		cellChains:              chains,
 		cellTypes:               cellTypes,
 		affinityGroups:          map[string]*AlgoAffinityGroup{},
+		quotaExcludeVCs:         sConfig.QuotaExcludeVCs,
 		apiClusterStatus: api.ClusterStatus{
 			PhysicalCluster: api.PhysicalClusterStatus{},
 			VirtualClusters: map[api.VirtualClusterName]api.VirtualClusterStatus{},
@@ -763,17 +766,21 @@ func (h *HivedAlgorithm) scheduleNewAffinityGroup(
 
 	klog.Infof("[%v]: Scheduling new affinity group %v", internal.Key(pod), s.AffinityGroup.Name)
 	priority := CellPriority(s.Priority)
+	percent  := CellPercent(s.Percent)
 	sr := schedulingRequest{
 		vc:                   s.VirtualCluster,
 		pinnedCellId:         s.PinnedCellId,
 		priority:             priority,
+		percent:              percent,
 		affinityGroupName:    s.AffinityGroup.Name,
 		affinityGroupPodNums: map[int32]int32{},
 		suggestedNodes:       suggestedNodes,
 		ignoreSuggestedNodes: s.IgnoreK8sSuggestedNodes,
+		quota:                s.Quota,
 	}
 	for _, m := range s.AffinityGroup.Members {
 		// we will merge group members with same leaf cell number
+		// OPENXPU FIXME: should complete with taskRole independently for each task sku persent
 		sr.affinityGroupPodNums[m.LeafCellNumber] += m.PodNumber
 	}
 	h.validateSchedulingRequest(sr, pod)
@@ -880,8 +887,8 @@ func (h *HivedAlgorithm) handleSchedulingRequest(
 	if sr.pinnedCellId != "" {
 		str = fmt.Sprintf("pinned cell %v", sr.pinnedCellId)
 	}
-	klog.Infof("Processing scheduling request: %v, leaf cell numbers %v, priority %v",
-		str, common.ToJson(sr.affinityGroupPodNums), sr.priority)
+	klog.Infof("Processing scheduling request: %v, leaf cell numbers %v, priority %v, percent %v",
+		str, common.ToJson(sr.affinityGroupPodNums), sr.priority, sr.percent)
 	if sr.priority >= minGuaranteedPriority {
 		physicalPlacement, virtualPlacement, failedReason = h.scheduleGuaranteedAffinityGroup(sr)
 	} else {
@@ -895,6 +902,62 @@ func (h *HivedAlgorithm) handleSchedulingRequest(
 	return physicalPlacement, virtualPlacement, ""
 }
 
+// scheduleUserQuota make sure that the number of SKUs used by the user does not exceed the quota.
+func (h *HivedAlgorithm) scheduleUserQuota(
+	sr schedulingRequest) (
+	failedReason string,
+	failed bool) {
+
+	// Exclude vc
+	var excludeVCs = make(map[string]bool)
+	if h.quotaExcludeVCs != nil {
+		for _, item := range h.quotaExcludeVCs {
+			excludeVCs[item] = true
+		}
+	}
+	if excludeVCs[string(sr.vc)] {
+		return "", false
+	}
+
+	// Get quota from sr
+	var quota = sr.quota
+
+	klog.Infof("quota.Tag, quota.Count: %v, %v", quota.Tag, quota.Count)
+
+	// No quota
+	if quota.Tag == "" || quota.Count < 0 {
+		return "", false
+	}
+
+	// Count used leaf cell count
+	var used int32 = 0
+	for group := range h.affinityGroups {
+		if h.affinityGroups[group].quota.Tag == quota.Tag {
+			// Exclude oppo jobs.
+			if h.affinityGroups[group].priority == int32(opportunisticPriority) {
+				continue
+			}
+			if excludeVCs[string(h.affinityGroups[group].vc)] {
+				continue
+			}
+			for pod := range h.affinityGroups[group].totalPodNums {
+				used += pod * h.affinityGroups[group].totalPodNums[pod]
+			}
+		}
+	}
+
+	// Count required leaf cell count
+	var required int32 = 0
+	for key := range sr.affinityGroupPodNums {
+		required += key * sr.affinityGroupPodNums[key]
+	}
+
+	if used+required > quota.Count {
+		return "exceeded user quota, used " + fmt.Sprint(used) + ", required " + fmt.Sprint(required) + ", quota " + fmt.Sprint(quota.Count), true
+	}
+	return "", false
+}
+
 // scheduleGuaranteedAffinityGroup schedules an affinity group in its VC,
 // and then maps the placement in VC to the physical cluster.
 func (h *HivedAlgorithm) scheduleGuaranteedAffinityGroup(
@@ -902,6 +965,12 @@ func (h *HivedAlgorithm) scheduleGuaranteedAffinityGroup(
 	physicalPlacement groupPhysicalPlacement,
 	virtualPlacement groupVirtualPlacement,
 	failedReason string) {
+
+	// schedule Quota
+	failedReason, failed := h.scheduleUserQuota(sr)
+	if failed {
+		return nil, nil, failedReason
+	}
 
 	// schedule in VC
 	virtualPlacement, failedReason = h.vcSchedulers[sr.vc].schedule(sr)
@@ -914,6 +983,9 @@ func (h *HivedAlgorithm) scheduleGuaranteedAffinityGroup(
 	common.SortInt32(leafCellNums)
 	lazyPreemptedGroups := h.tryLazyPreempt(virtualPlacement, leafCellNums, sr.affinityGroupName)
 	preassignedCells, nonPreassignedCells := virtualPlacement.toBindingPaths(leafCellNums, bindings)
+	for k, v := range bindings {
+		klog.V(4).Infof("OPENXPU bindings before [%v]=[%v]", k, v.GetAddress())
+	}
 	// make a copy of freeCellNum, may change its values during allocation
 	freeCellNumCopy := map[CellLevel]int32{}
 	for k, v := range h.allVCFreeCellNum[sr.chain] {
@@ -922,11 +994,15 @@ func (h *HivedAlgorithm) scheduleGuaranteedAffinityGroup(
 	if ok := mapVirtualPlacementToPhysical(
 		preassignedCells,
 		nonPreassignedCells,
+		sr.percent,
 		h.freeCellList[sr.chain].shallowCopy(),
 		freeCellNumCopy,
 		sr.suggestedNodes,
 		sr.ignoreSuggestedNodes,
 		bindings); ok {
+		for k, v := range bindings {
+			klog.V(4).Infof("OPENXPU bindings after [%v]=[%v]", k, v.GetAddress())
+		}
 		return virtualPlacement.toPhysicalPlacement(bindings, leafCellNums), virtualPlacement, ""
 	}
 	for groupName, placement := range lazyPreemptedGroups {
@@ -953,7 +1029,7 @@ func (h *HivedAlgorithm) tryLazyPreempt(
 		for _, pod := range podPlacements {
 			for _, leafCell := range pod {
 				if pLeafCell := leafCell.(*VirtualCell).GetPhysicalCell(); pLeafCell != nil {
-					if pLeafCell.GetState() == cellUsed && pLeafCell.GetUsingGroup().lazyPreemptionEnable {
+					if (pLeafCell.GetState() == cellUsed) && pLeafCell.GetUsingGroup().lazyPreemptionEnable {
 						preemptedGroups[pLeafCell.GetUsingGroup().name] = h.lazyPreemptAffinityGroup(
 							pLeafCell.GetUsingGroup(), groupName)
 					}
@@ -971,7 +1047,7 @@ func (h *HivedAlgorithm) scheduleOpportunisticAffinityGroup(
 	failedReason string) {
 
 	placement, failedReason = h.opportunisticSchedulers[sr.chain].Schedule(
-		sr.affinityGroupPodNums, opportunisticPriority, sr.suggestedNodes, sr.ignoreSuggestedNodes)
+		sr.affinityGroupPodNums, opportunisticPriority, sr.percent, sr.suggestedNodes, sr.ignoreSuggestedNodes)
 	if placement == nil {
 		return nil, fmt.Sprintf("%v when scheduling in physical cluster", failedReason)
 	}
@@ -982,7 +1058,7 @@ func (h *HivedAlgorithm) scheduleOpportunisticAffinityGroup(
 func (h *HivedAlgorithm) createAllocatedAffinityGroup(s *api.PodSchedulingSpec, info *api.PodBindInfo, pod *core.Pod) {
 	klog.Infof("[%v]: Creating new allocated affinity group: %v", internal.Key(pod), s.AffinityGroup.Name)
 	newGroup := newAlgoAffinityGroup(
-		s.AffinityGroup, s.VirtualCluster, s.LazyPreemptionEnable, s.Priority, groupAllocated)
+		s.AffinityGroup, s.VirtualCluster, s.LazyPreemptionEnable, s.Priority, s.Percent, s.Quota, groupAllocated)
 	shouldLazyPreempt := false
 	for _, gms := range info.AffinityGroupBindInfo {
 		leafCellNumber := int32(len(gms.PodPlacements[0].PhysicalLeafCellIndices))
@@ -1022,9 +1098,13 @@ func (h *HivedAlgorithm) createAllocatedAffinityGroup(s *api.PodSchedulingSpec, 
 					// Such case won't happen by design as buddy alloc guarantees safety; but this could
 					// happen due to inconsistency of VC assignments for reasons like reconfiguration.
 					// In this case, we will lazy preempt this affinity group.
-					safetyOk, reason := h.allocateLeafCell(pLeafCell, vLeafCell, CellPriority(s.Priority), newGroup.vc)
+					safetyOk, reason := h.allocateLeafCell(pLeafCell, vLeafCell, CellPriority(s.Priority), CellPercent(s.Percent), newGroup.vc)
 					pLeafCell.AddUsingGroup(newGroup)
-					setCellState(pLeafCell, cellUsed)
+					if pLeafCell.GetPercent() == maxGuaranteedPercent {
+						setCellState(pLeafCell, cellUsed)
+					} else {
+						setCellState(pLeafCell, cellHalf)
+					}
 					if !safetyOk {
 						shouldLazyPreempt = true
 						klog.Warningf("[%v]: %v", internal.Key(pod), reason)
@@ -1054,9 +1134,12 @@ func (h *HivedAlgorithm) deleteAllocatedAffinityGroup(g *AlgoAffinityGroup, pod 
 				pLeafCell := leafCell.(*PhysicalCell)
 				pLeafCell.DeleteUsingGroup(g)
 				// state of pLeafCell can be either Used or Reserving
-				if pLeafCell.GetState() == cellUsed {
-					h.releaseLeafCell(pLeafCell, g.vc)
-					setCellState(pLeafCell, cellFree)
+				if pLeafCell.GetState() == cellUsed || pLeafCell.GetState() == cellHalf {
+					klog.V(4).Infof("OPENXPU deleteAllocatedAffinityGroup pLeafCell.GetState (%v)", pLeafCell.GetState())
+					h.releaseLeafCell(pLeafCell, CellPercent(g.percent), g.vc)
+					if pLeafCell.GetPercent() == minGuaranteedPercent {
+						setCellState(pLeafCell, cellFree)
+					}
 				} else { // cellReserving
 					// When pLeafCell is in Reserving state, we shouldn't call h.releaseLeafCell
 					// because it must have been allocated to the reserving group before
@@ -1081,7 +1164,7 @@ func (h *HivedAlgorithm) createPreemptingAffinityGroup(
 
 	klog.Infof("[%v]: Creating new preempting affinity group: %v", internal.Key(pod), s.AffinityGroup.Name)
 	newGroup := newAlgoAffinityGroup(
-		s.AffinityGroup, s.VirtualCluster, s.LazyPreemptionEnable, s.Priority, groupPreempting)
+		s.AffinityGroup, s.VirtualCluster, s.LazyPreemptionEnable, s.Priority, s.Percent, s.Quota, groupPreempting)
 	newGroup.physicalLeafCellPlacement = physicalPlacement
 	newGroup.virtualLeafCellPlacement = virtualPlacement
 	for leafCellNum := range physicalPlacement {
@@ -1089,16 +1172,18 @@ func (h *HivedAlgorithm) createPreemptingAffinityGroup(
 			for leafCellIndex, leafCell := range physicalPlacement[leafCellNum][podIndex] {
 				pLeafCell := leafCell.(*PhysicalCell)
 				vLeafCell := virtualPlacement[leafCellNum][podIndex][leafCellIndex].(*VirtualCell)
-				if pLeafCell.GetState() == cellUsed {
+				if pLeafCell.GetState() == cellUsed || pLeafCell.GetState() == cellHalf {
 					usingGroup := pLeafCell.GetUsingGroup()
-					h.releaseLeafCell(pLeafCell, usingGroup.vc)
+					// FIXME
+					klog.V(4).Infof("OPENXPU createPreemptingAffinityGroup pLeafCell.GetState (%v)", pLeafCell.GetState())
+					h.releaseLeafCell(pLeafCell, CellPercent(s.Percent), usingGroup.vc)
 					usingGroup.state = groupBeingPreempted
 				}
-				h.allocateLeafCell(pLeafCell, vLeafCell, CellPriority(s.Priority), newGroup.vc)
+				h.allocateLeafCell(pLeafCell, vLeafCell, CellPriority(s.Priority), CellPercent(s.Percent), newGroup.vc)
 				pLeafCell.AddReservingOrReservedGroup(newGroup)
 				// state of pLeafCell can be either Used or Free (if it was Reserving or Reserved,
 				// we must have canceled the ongoing preemption before, in h.Schedule)
-				if pLeafCell.GetState() == cellUsed {
+				if pLeafCell.GetState() == cellUsed || pLeafCell.GetState() == cellHalf {
 					setCellState(pLeafCell, cellReserving)
 				} else { // cellFree
 					setCellState(pLeafCell, cellReserved)
@@ -1118,7 +1203,7 @@ func (h *HivedAlgorithm) deletePreemptingAffinityGroup(g *AlgoAffinityGroup, pod
 		for podIndex := range g.physicalLeafCellPlacement[leafCellNum] {
 			for _, leafCell := range g.physicalLeafCellPlacement[leafCellNum][podIndex] {
 				pLeafCell := leafCell.(*PhysicalCell)
-				h.releaseLeafCell(pLeafCell, g.vc)
+				h.releaseLeafCell(pLeafCell, CellPercent(g.percent), g.vc)
 				pLeafCell.DeleteReservingOrReservedGroup(pLeafCell.GetReservingOrReservedGroup())
 				// state of pLeafCell can be either Reserving or Reserved
 				if pLeafCell.GetState() == cellReserving {
@@ -1132,7 +1217,7 @@ func (h *HivedAlgorithm) deletePreemptingAffinityGroup(g *AlgoAffinityGroup, pod
 							beingPreemptedGroup.virtualLeafCellPlacement, pLeafCell)
 					}
 					h.allocateLeafCell(
-						pLeafCell, beingPreemptedVLeafCell, CellPriority(beingPreemptedGroup.priority), beingPreemptedGroup.vc)
+						pLeafCell, beingPreemptedVLeafCell, CellPriority(beingPreemptedGroup.priority), CellPercent(beingPreemptedGroup.percent), beingPreemptedGroup.vc)
 				} else { // cellReserved
 					setCellState(pLeafCell, cellFree)
 				}
@@ -1152,7 +1237,11 @@ func (h *HivedAlgorithm) allocatePreemptingAffinityGroup(g *AlgoAffinityGroup, p
 				pLeafCell := leafCell.(*PhysicalCell)
 				pLeafCell.DeleteReservingOrReservedGroup(g)
 				pLeafCell.AddUsingGroup(g)
-				setCellState(pLeafCell, cellUsed)
+				if pLeafCell.GetPercent() == maxGuaranteedPercent {
+					setCellState(pLeafCell, cellUsed)
+				} else {
+					setCellState(pLeafCell, cellHalf)
+				}
 			}
 		}
 	}
@@ -1172,8 +1261,8 @@ func (h *HivedAlgorithm) lazyPreemptAffinityGroup(
 				if leafCell != nil {
 					vLeafCell := leafCell.(*VirtualCell)
 					pLeafCell := vLeafCell.GetPhysicalCell()
-					h.releaseLeafCell(pLeafCell, victim.vc)
-					h.allocateLeafCell(pLeafCell, nil, opportunisticPriority, victim.vc)
+					h.releaseLeafCell(pLeafCell, CellPercent(victim.percent), victim.vc)
+					h.allocateLeafCell(pLeafCell, nil, opportunisticPriority, minGuaranteedPercent, victim.vc)
 				}
 			}
 		}
@@ -1208,8 +1297,8 @@ func (h *HivedAlgorithm) revertLazyPreempt(g *AlgoAffinityGroup, virtualPlacemen
 				}
 				pLeafCell := leafCell.(*PhysicalCell)
 				vLeafCell := virtualPlacement[leafCellNum][podIndex][leafCellIndex].(*VirtualCell)
-				h.releaseLeafCell(pLeafCell, g.vc)
-				h.allocateLeafCell(pLeafCell, vLeafCell, CellPriority(g.priority), g.vc)
+				h.releaseLeafCell(pLeafCell, CellPercent(g.percent), g.vc)
+				h.allocateLeafCell(pLeafCell, vLeafCell, CellPriority(g.priority), CellPercent(g.percent), g.vc)
 			}
 		}
 	}
@@ -1295,14 +1384,29 @@ func (h *HivedAlgorithm) allocateLeafCell(
 	pLeafCell *PhysicalCell,
 	vLeafCell *VirtualCell,
 	p CellPriority,
+	s CellPercent,
 	vcn api.VirtualClusterName) (safetyOk bool, reason string) {
 
 	safetyOk = true
 	if vLeafCell != nil {
+		sOld := vLeafCell.GetPercent()
+		setCellPercent(vLeafCell, s, true)
+		sNew := vLeafCell.GetPercent()
+		updateUsedLeafCellNumAtPercent(vLeafCell, sOld, sNew)
+		sOld = pLeafCell.GetPercent()
+		setCellPercent(pLeafCell, s, true)
+		sNew = pLeafCell.GetPercent()
+		updateUsedLeafCellNumAtPercent(pLeafCell, sOld, sNew)
 		setCellPriority(vLeafCell, p)
-		updateUsedLeafCellNumAtPriority(vLeafCell, p, true)
+		if vLeafCell.GetPercent() == maxGuaranteedPercent {
+			klog.V(4).Infof("OPENXPU Update vLeafCell priority (%v)", vLeafCell.GetAddress())
+			updateUsedLeafCellNumAtPriority(vLeafCell, p, true)
+		}
 		setCellPriority(pLeafCell, p)
-		updateUsedLeafCellNumAtPriority(pLeafCell, p, true)
+		if pLeafCell.GetPercent() == maxGuaranteedPercent {
+			klog.V(4).Infof("OPENXPU Update pLeafCell priority (%v)", pLeafCell.GetAddress())
+			updateUsedLeafCellNumAtPriority(pLeafCell, p, true)
+		}
 		pac := vLeafCell.GetPreassignedCell()
 		preassignedNewlyBound := pac.GetPhysicalCell() == nil
 		if pLeafCell.GetVirtualCell() == nil {
@@ -1314,7 +1418,12 @@ func (h *HivedAlgorithm) allocateLeafCell(
 		}
 	} else {
 		setCellPriority(pLeafCell, opportunisticPriority)
+		klog.V(4).Infof("OPENXPU Update pLeafCell opportunisticPriority (%v)", pLeafCell.GetAddress())
 		updateUsedLeafCellNumAtPriority(pLeafCell, opportunisticPriority, true)
+		sOld := pLeafCell.GetPercent()
+		setCellPercent(pLeafCell, minGuaranteedPercent, true)
+		sNew := pLeafCell.GetPercent()
+		updateUsedLeafCellNumAtPercent(pLeafCell, sOld, sNew)
 		pLeafCell.GetAPIStatus().VC = vcn
 		h.apiClusterStatus.VirtualClusters[vcn] = append(
 			h.apiClusterStatus.VirtualClusters[vcn], generateOTVirtualCell(pLeafCell.GetAPIStatus()))
@@ -1324,14 +1433,27 @@ func (h *HivedAlgorithm) allocateLeafCell(
 
 // releaseLeafCell destroys the cell bindings, release the preassigned cell (if necessary),
 // and resets the priority.
-func (h *HivedAlgorithm) releaseLeafCell(pLeafCell *PhysicalCell, vcn api.VirtualClusterName) {
+func (h *HivedAlgorithm) releaseLeafCell(pLeafCell *PhysicalCell, p CellPercent, vcn api.VirtualClusterName) {
 	if vLeafCell := pLeafCell.GetVirtualCell(); vLeafCell != nil {
-		updateUsedLeafCellNumAtPriority(vLeafCell, vLeafCell.GetPriority(), false)
-		setCellPriority(vLeafCell, freePriority)
+		sOld := vLeafCell.GetPercent()
+		setCellPercent(vLeafCell, p, false)
+		sNew := vLeafCell.GetPercent()
+		updateUsedLeafCellNumAtPercent(vLeafCell, sOld, sNew)
+
+		if vLeafCell.GetPercent() == minGuaranteedPercent {
+			updateUsedLeafCellNumAtPriority(vLeafCell, vLeafCell.GetPriority(), false)
+			setCellPriority(vLeafCell, freePriority)
+		}
+
+		klog.V(4).Infof("OPENXPU releaseLeafCell vLeafCell.GetAddress (%v), vLeafCell.GetLevel (%v), vLeafCell.GetPercent (%v)", vLeafCell.GetAddress(), vLeafCell.GetLevel(), vLeafCell.GetPercent())
+
 		preassignedPhysical := vLeafCell.GetPreassignedCell().GetPhysicalCell()
 		if pLeafCell.IsHealthy() {
 			// we won't unbind the cell if it is bad
-			unbindCell(pLeafCell)
+			// OPENXPU: only when no vLeafCell use we can unbind phy cell
+			if vLeafCell.GetPercent() == minGuaranteedPercent {
+				unbindCell(pLeafCell)
+			}
 		}
 		// To check if we should release the preassigned cell, we cannot simply check if the
 		// virtual cell is already unbound. It's possible that the cell is bad, then the binding
@@ -1347,8 +1469,17 @@ func (h *HivedAlgorithm) releaseLeafCell(pLeafCell *PhysicalCell, vcn api.Virtua
 		h.apiClusterStatus.VirtualClusters[vcn] = deleteOTVirtualCell(
 			h.apiClusterStatus.VirtualClusters[vcn], pLeafCell.GetAddress())
 	}
-	updateUsedLeafCellNumAtPriority(pLeafCell, pLeafCell.GetPriority(), false)
-	setCellPriority(pLeafCell, freePriority)
+	sOld := pLeafCell.GetPercent()
+	setCellPercent(pLeafCell, p, false)
+	sNew := pLeafCell.GetPercent()
+	updateUsedLeafCellNumAtPercent(pLeafCell, sOld, sNew)
+
+	if pLeafCell.GetPercent() == minGuaranteedPercent {
+		updateUsedLeafCellNumAtPriority(pLeafCell, pLeafCell.GetPriority(), false)
+		setCellPriority(pLeafCell, freePriority)
+	}
+
+	klog.V(4).Infof("OPENXPU releaseLeafCell pLeafCell.GetAddress (%v), pLeafCell.GetLevel (%v), pLeafCell.GetPercent (%v), pLeafCell.GetPriority (%v)", pLeafCell.GetAddress(), pLeafCell.GetLevel(), pLeafCell.GetPercent(), pLeafCell.GetPriority())
 }
 
 // allocatePreassignedCell allocates a physical cell to a preassigned virtual cell, removes the physical cell

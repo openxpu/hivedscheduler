@@ -75,9 +75,17 @@ type PinnedCellSpec struct {
 	PinnedCellId PinnedCellId `yaml:"pinnedCellId"`
 }
 
+type Quota struct {
+	// Tag for quota
+	Tag string `yaml:"tag,omitempty"`
+	// Count for quota
+	Count int32 `yaml:"count,omitempty"`
+}
+
 type PodSchedulingSpec struct {
 	VirtualCluster          VirtualClusterName `yaml:"virtualCluster"`
 	Priority                int32              `yaml:"priority"`
+	Percent                 int32              `yaml:"percent"`
 	PinnedCellId            PinnedCellId       `yaml:"pinnedCellId"`
 	LeafCellType            string             `yaml:"leafCellType"`
 	LeafCellNumber          int32              `yaml:"leafCellNumber"`
@@ -85,6 +93,7 @@ type PodSchedulingSpec struct {
 	LazyPreemptionEnable    bool               `yaml:"lazyPreemptionEnable"`
 	IgnoreK8sSuggestedNodes bool               `yaml:"ignoreK8sSuggestedNodes" default:"true"`
 	AffinityGroup           *AffinityGroupSpec `yaml:"affinityGroup"`
+	Quota                   Quota              `yaml:"quota,omitempty"`
 }
 
 type AffinityGroupSpec struct {
@@ -156,6 +165,7 @@ type AffinityGroupState string
 type AffinityGroupStatus struct {
 	VC                   VirtualClusterName            `json:"vc"`
 	Priority             int32                         `json:"priority"`
+	Percent              int32                         `json:"percent"`
 	State                AffinityGroupState            `json:"state"`
 	PhysicalPlacement    map[string][]int32            `json:"physicalPlacement,omitempty"` // node -> leaf cell indices
 	VirtualPlacement     map[CellAddress][]CellAddress `json:"virtualPlacement,omitempty"`  // preassigned cell -> leaf cells
@@ -197,6 +207,7 @@ type CellStatus struct {
 	CellState       CellState       `json:"cellState"`
 	CellHealthiness CellHealthiness `json:"cellHealthiness"`
 	CellPriority    int32           `json:"cellPriority"`
+	CellPercent     int32           `json:"cellPercent"`
 }
 
 type PhysicalCellStatus struct {

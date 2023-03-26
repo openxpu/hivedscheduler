@@ -42,9 +42,13 @@ type Cell interface {
 	AtOrHigherThanNode() bool
 	GetPriority() CellPriority
 	SetPriority(CellPriority)
+	GetPercent() CellPercent
+	SetPercent(CellPercent)
 	GetTotalLeafCellNum() int32
 	GetUsedLeafCellNumAtPriorities() map[CellPriority]int32
 	IncreaseUsedLeafCellNumAtPriority(CellPriority, int32)
+	GetUsedLeafCellNumAtPercents() map[CellPercent]int32
+	IncreaseUsedLeafCellNumAtPercent(CellPercent, int32)
 }
 
 func CellEqual(c1 Cell, c2 Cell) bool {
@@ -63,12 +67,14 @@ type GenericCell struct {
 	children           CellList // pointer to its children cells
 	atOrHigherThanNode bool     // true if the cell is at or higher than node level
 	priority           CellPriority
+	percent            CellPercent
 	state              CellState
 	// A cell is healthy if all of the cell's children are healthy (bad if any child is bad).
 	// The healthy field is orthogonal to priority and state.
 	healthy                     bool
 	totalLeafCellNum            int32                  // total leaf cell number of a cell
 	usedLeafCellNumAtPriorities map[CellPriority]int32 // leaf cell number used by each priority
+	usedLeafCellNumAtPercents   map[CellPercent]int32  // leaf cell number used by each percent
 }
 
 func (c *GenericCell) GetChain() CellChain {
@@ -103,6 +109,10 @@ func (c *GenericCell) GetPriority() CellPriority {
 	return c.priority
 }
 
+func (c *GenericCell) GetPercent() CellPercent {
+	return c.percent
+}
+
 func (c *GenericCell) GetState() CellState {
 	return c.state
 }
@@ -121,8 +131,19 @@ func (c *GenericCell) GetUsedLeafCellNumAtPriorities() map[CellPriority]int32 {
 
 func (c *GenericCell) IncreaseUsedLeafCellNumAtPriority(p CellPriority, delta int32) {
 	c.usedLeafCellNumAtPriorities[p] += delta
-	if c.usedLeafCellNumAtPriorities[p] == 0 {
+	if c.usedLeafCellNumAtPriorities[p] <= 0 {
 		delete(c.usedLeafCellNumAtPriorities, p)
+	}
+}
+
+func (c *GenericCell) GetUsedLeafCellNumAtPercents() map[CellPercent]int32 {
+	return c.usedLeafCellNumAtPercents
+}
+
+func (c *GenericCell) IncreaseUsedLeafCellNumAtPercent(p CellPercent, delta int32) {
+	c.usedLeafCellNumAtPercents[p] += delta
+	if c.usedLeafCellNumAtPercents[p] == 0 {
+		delete(c.usedLeafCellNumAtPercents, p)
 	}
 }
 
@@ -155,10 +176,12 @@ func NewPhysicalCell(
 			chain:                       c,
 			level:                       l,
 			priority:                    freePriority,
+			percent:                     minGuaranteedPercent,
 			address:                     address,
 			atOrHigherThanNode:          g,
 			totalLeafCellNum:            n,
 			usedLeafCellNumAtPriorities: map[CellPriority]int32{},
+			usedLeafCellNumAtPercents:   map[CellPercent]int32{},
 			state:                       cellFree,
 			// cells are set to healthy initially, and will be all set to bad in HivedAlgorithm.initBadNodes
 			healthy: true,
@@ -171,6 +194,7 @@ func NewPhysicalCell(
 				CellState:       api.CellState(cellFree),
 				CellHealthiness: api.CellHealthy,
 				CellPriority:    int32(freePriority),
+				CellPercent:     int32(minGuaranteedPercent),
 			},
 		},
 	}
@@ -189,6 +213,14 @@ func (c *PhysicalCell) SetPriority(p CellPriority) {
 	c.apiStatus.CellPriority = int32(p)
 	if c.apiStatus.VirtualCell != nil {
 		c.apiStatus.VirtualCell.CellPriority = int32(p)
+	}
+}
+
+func (c *PhysicalCell) SetPercent(p CellPercent) {
+	c.percent = p
+	c.apiStatus.CellPercent = int32(c.percent)
+	if c.apiStatus.VirtualCell != nil {
+		c.apiStatus.VirtualCell.CellPercent = int32(c.percent)
 	}
 }
 
@@ -339,10 +371,12 @@ func NewVirtualCell(
 			chain:                       c,
 			level:                       l,
 			priority:                    freePriority,
+			percent:                     minGuaranteedPercent,
 			address:                     address,
 			atOrHigherThanNode:          g,
 			totalLeafCellNum:            n,
 			usedLeafCellNumAtPriorities: map[CellPriority]int32{},
+			usedLeafCellNumAtPercents:   map[CellPercent]int32{},
 			state:                       cellFree,
 			// cells are set to healthy initially, and will be all set to bad in HivedAlgorithm.initBadNodes
 			healthy: true,
@@ -357,6 +391,7 @@ func NewVirtualCell(
 				CellState:       api.CellState(cellFree),
 				CellHealthiness: api.CellHealthy,
 				CellPriority:    int32(freePriority),
+				CellPercent:     int32(minGuaranteedPercent),
 			},
 		},
 	}
@@ -375,6 +410,14 @@ func (c *VirtualCell) SetPriority(p CellPriority) {
 	c.apiStatus.CellPriority = int32(p)
 	if c.apiStatus.PhysicalCell != nil {
 		c.apiStatus.PhysicalCell.CellPriority = int32(p)
+	}
+}
+
+func (c *VirtualCell) SetPercent(p CellPercent) {
+	c.percent = p
+	c.apiStatus.CellPercent = int32(p)
+	if c.apiStatus.PhysicalCell != nil {
+		c.apiStatus.PhysicalCell.CellPercent = int32(c.percent)
 	}
 }
 
